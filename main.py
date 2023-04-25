@@ -5,6 +5,8 @@ from tensorflow.keras.layers import (
 from tensorflow.keras.models import Model
 from datetime import datetime
 
+from tqdm import tqdm
+
 from get_background import get_background_examples
 from dataclasses import dataclass
 
@@ -125,14 +127,13 @@ def diffusion_process(data, noise_stddev_seq):
 
 
 def train_conditional_denoising_model(model, generator, num_batches, noise_stddev_seq, batch_size):
-    for batch_num, (noise_samples, gps_times) in enumerate(generator):
+    for batch_num, (noise_samples, gps_times) in tqdm(enumerate(generator)):
         print(f"Training on batch {batch_num + 1}/{num_batches}")
         processed_noise_samples, conditions = process_generator_output(noise_samples, gps_times)
         
         noisy_data_seq = diffusion_process(processed_noise_samples, noise_stddev_seq)
 
         for t in reversed(range(noisy_data_seq.shape[1])):
-            print(f"Training denoising model for timestep {t + 1}/{noisy_data_seq.shape[1]}")
             model.fit([noisy_data_seq[:, t], conditions], processed_noise_samples, epochs=1, batch_size=batch_size, verbose=2)
         
 def generate_conditional_audio(model, initial_noise, conditions, noise_stddev_seq):
