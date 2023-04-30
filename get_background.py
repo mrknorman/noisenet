@@ -36,10 +36,10 @@ class NoiseChunk:
         # Calculate the t0 for each captured subsection
         t0_subsections = self.t0 + tf.cast(random_starts, dtype=tf.float32) * self.dt
 
-        return batch_subtensors, t0_subsections
+        return tf.expand_dims(batch_subtensors, axis=-1), t0_subsections
     
 def timeseries_to_noise_chunk(timeseries : TimeSeries, scale_factor : float):
-    data = tf.convert_to_tensor(timeseries.value * scale_factor, dtype = tf.float16)
+    data = tf.convert_to_tensor(timeseries.value * scale_factor, dtype = tf.float32)
     return NoiseChunk(data, timeseries.t0.value, timeseries.dt.value)
 
 def get_background_examples(
@@ -54,8 +54,8 @@ def get_background_examples(
     example_duration_seconds: float = 1.0,
     max_num_examples: float = 0.0,
     num_examples_per_batch: int = 1,
-    scale_factor: float = 1.0E20,
-    order: str = None,
+    scale_factor: float = 1.0,
+    order: str = "random",
 ):
     segments = DataQualityDict.query_dqsegdb(
         [f"{ifo}:{state_flag}"],
@@ -68,14 +68,16 @@ def get_background_examples(
     valid_segments = []
 
     for seg_start, seg_stop in intersection:
-        if (seg_stop - seg_start) >= example_duration_seconds:
+        if (seg_stop - seg_start) >= example_duration_seconds*num_examples_per_batch:
             valid_segments.append((seg_start, seg_stop))
 
     if not valid_segments:
         raise ValueError("No segments of minimum length, not producing background")
 
-    if order not in ("segment", "example"):
+    if order == "random":
         shuffle(valid_segments)
+    elif order == "shortest_first":
+        valid_segments = sorted(valid_segments, key=lambda duration: duration[1] - duration[0])
 
     def get_new_segment_data(segment_start, segment_end):
         files = find_urls(
@@ -90,6 +92,7 @@ def get_background_examples(
             files, channel=f"{ifo}:{channel}", start=segment_start, end=segment_end
         )
         data = data.resample(sample_rate_hertz)
+        data = data.whiten(4, 2)
 
         if np.isnan(data).any():
             raise ValueError(f"The background for ifo {ifo} contains NaN values")
@@ -116,7 +119,7 @@ def get_background_examples(
                 
                 if (max_num_examples > 0) and (current_example_index > max_num_examples):
                     return
-                    
+                                    
                 yield batch_noise_data
 
         except Exception as e:

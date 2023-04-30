@@ -5,13 +5,69 @@ from tensorflow.keras.layers import (
 from tensorflow.keras.models import Model
 from datetime import datetime
 
+import time
+
+from tensorflow.keras import mixed_precision
+
 from tqdm import tqdm
 
 from get_background import get_background_examples
 from dataclasses import dataclass
 
+import matplotlib.pyplot as plt
+
 import os
 
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import tensorflow as tf
+
+def save_diffusion_plots(output_data, labels, batch_idx, num_steps, N, file_name='diffusion_plots.png'):
+    """
+    Takes the output of the diffusion process and saves N evenly spaced subplots between step 0 and the max step.
+
+    :param output_data: The output of the diffusion_process function.
+    :param batch_idx: The index of the batch to use for creating the plots.
+    :param N: The number of subplots to create.
+    :param file_name: The name of the file to save the plot as (default: 'diffusion_plots.png').
+    """
+    
+    steps_to_plot = np.linspace(0, num_steps - 1, N, dtype=int)
+
+    # Create a new figure with a custom height based on the number of subplots
+    plt.figure(figsize=(12, 3 * N))
+
+    # Create a GridSpec with N rows and 1 column
+    gs = gridspec.GridSpec(N, 2, height_ratios=[1]*N, hspace=0.5)
+
+    for idx, step in enumerate(steps_to_plot):
+        # Create a subplot using the GridSpec
+        ax = plt.subplot(gs[idx*2])
+
+        # Plot the specified step of the diffusion process for the specified batch
+        ax.plot(tf.squeeze(output_data[step]).numpy())
+
+        # Set title and labels
+        ax.set_title(f'Step {step + 1}')
+        ax.set_xlabel('Sample Index')
+        ax.set_ylabel('Amplitude')
+        
+        ax = plt.subplot(gs[idx*2 + 1])
+
+        # Plot the specified step of the diffusion process for the specified batch
+        ax.plot(tf.squeeze(labels[step]).numpy())
+
+        # Set title and labels
+        ax.set_title(f'Step Label')
+        ax.set_xlabel('Sample Index')
+        ax.set_ylabel('Amplitude')
+
+    # Save the plot to a file
+    plt.savefig(file_name)
+
+    # Close the figure
+    plt.close()
 
 def setup_CUDA(verbose, device_num):
 		
@@ -88,6 +144,9 @@ def process_generator_output(noise_samples, gps_times):
 
     return noise_samples, conditions.stack()
 
+def process_generator_output_function(noise_samples, gps_times):
+    return tf.py_function(process_generator_output, [noise_samples, gps_times], [tf.float32, tf.float32])
+
 def create_conditional_1d_denoising_model(input_shape, num_conditions, num_filters=32, kernel_size=3):
     audio_input = Input(shape=input_shape)
     conditions_input = Input(shape=(num_conditions,))
@@ -115,26 +174,50 @@ def create_conditional_1d_denoising_model(input_shape, num_conditions, num_filte
     output = Conv1DTranspose(input_shape[-1], kernel_size, padding='same', activation='linear')(x)
     
     model = Model(inputs=[audio_input, conditions_input], outputs=output)
+    
     return model
+    
+def diffusion_process(processed_noise_samples, num_steps):
+    expanded_input = tf.expand_dims(processed_noise_samples, axis=1) 
+    gaussian_noise = tf.random.normal(expanded_input.shape, dtype=tf.float32)
+    
+    # Generate the linear noise_stddev_seq tensor with the correct shape
+    linear_seq = tf.linspace(0.0, 1.0, num_steps)
+    noise_stddev_seq = tf.reshape(linear_seq, [1, -1, 1, 1])
+    
+    # Tile the noise_stddev_seq tensor along the first axis to match the first dimension of processed_noise_samples
+    noise_stddev_seq_expanded = tf.tile(noise_stddev_seq, [processed_noise_samples.shape[0], 1, processed_noise_samples.shape[1], processed_noise_samples.shape[2]])
+    noisy_data_seq = expanded_input * (1.0 - noise_stddev_seq_expanded) + gaussian_noise * noise_stddev_seq_expanded
+    
+    new_first_dim = (noisy_data_seq.shape[0] * noisy_data_seq.shape[1])
+    return tf.reshape(noisy_data_seq, (new_first_dim, noisy_data_seq.shape[2], noisy_data_seq.shape[3]))
 
-def diffusion_process(data, noise_stddev_seq):
-    noisy_data_seq = []
-    current_data = data[..., np.newaxis]  # Add the channel dimension
-    for noise_stddev in noise_stddev_seq:
-        current_data = current_data + np.random.normal(0, noise_stddev, current_data.shape)
-        noisy_data_seq.append(current_data)
-    return np.stack(noisy_data_seq, axis=1)
+def train_conditional_denoising_model(model, generator, num_batches, num_steps, batch_size):
+    dataset = tf.data.Dataset.from_generator(
+        generator,
+        output_signature=(
+            tf.TensorSpec(shape=(batch_size, int(sample_rate_hertz * example_duration_seconds), 1), dtype=tf.float32),
+            tf.TensorSpec(shape=(batch_size,), dtype=tf.float32)
+        )
+    )
+    dataset = dataset.map(
+        process_generator_output_function,
+        num_parallel_calls=tf.data.AUTOTUNE
+    )
+    dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
 
-
-def train_conditional_denoising_model(model, generator, num_batches, noise_stddev_seq, batch_size):
-    for batch_num, (noise_samples, gps_times) in tqdm(enumerate(generator)):
-        print(f"Training on batch {batch_num + 1}/{num_batches}")
-        processed_noise_samples, conditions = process_generator_output(noise_samples, gps_times)
+    for batch_num, (processed_noise_samples, conditions) in tqdm(enumerate(dataset)):    
         
-        noisy_data_seq = diffusion_process(processed_noise_samples, noise_stddev_seq)
-
-        for t in reversed(range(noisy_data_seq.shape[1])):
-            model.fit([noisy_data_seq[:, t], conditions], processed_noise_samples, epochs=1, batch_size=batch_size, verbose=2)
+        noisy_data_seq = diffusion_process(processed_noise_samples, num_steps)
+        
+        conditions = tf.repeat(conditions, num_steps, axis=0)
+        targets = tf.repeat(processed_noise_samples, num_steps, axis=0)
+                        
+        # Run a single training step
+        model.fit([noisy_data_seq, conditions], targets, epochs=1, batch_size=batch_size*num_steps, verbose=2)
+        
+        if (batch_num % 1000) == 0:
+            model.save("noisenet")
         
 def generate_conditional_audio(model, initial_noise, conditions, noise_stddev_seq):
     current_data = initial_noise
@@ -178,6 +261,7 @@ frame_type = "HOFT_C01"
 state_flag = "DCS-ANALYSIS_READY_C01:1"
 
 batch_size = 32
+num_steps = 128
 
 max_num_examples = 1E6
 num_batches = int(max_num_examples / batch_size)
@@ -197,14 +281,38 @@ background_noise_iterator = get_background_examples(
     max_num_examples = max_num_examples,
     num_examples_per_batch = batch_size
 )
+
+def return_gen():
+    return get_background_examples(
+    start = start,
+    stop = stop,
+    ifo = "L1",
+    sample_rate_hertz = sample_rate_hertz,
+    channel = channel,
+    frame_type = frame_type,
+    state_flag = state_flag,
+    example_duration_seconds = example_duration_seconds,
+    max_num_examples = max_num_examples,
+    num_examples_per_batch = batch_size,
+    order = "random"
+)
+
+if __name__ == "__main__":
     
-noise_stddev_seq = np.linspace(0.01, 0.5, 50)  # Noise standard deviation sequence for diffusion process
-epochs = 10
+    strategy = setup_CUDA(True, "0")
+    print("CUDA setup complete.")
+    
+    
+    with strategy.scope():
+        epochs = 10
 
-input_shape = (int(sample_rate_hertz * example_duration_seconds), 1)
-num_conditions = 9
+        input_shape = (int(sample_rate_hertz * example_duration_seconds), 1)
+        num_conditions = 9
 
-model = create_conditional_1d_denoising_model(input_shape, num_conditions)
+        model = create_conditional_1d_denoising_model(input_shape, num_conditions)
+        print("Denoising model created.")  # Add a print statement after creating the denoising model
 
-model.compile(optimizer='adam', loss='mean_squared_error')
-train_conditional_denoising_model(model, background_noise_iterator, num_batches, noise_stddev_seq, batch_size)
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-6), loss='mean_squared_error')
+        print("Model compiled.")  # Add a print statement after compiling the model
+        
+        train_conditional_denoising_model(model, return_gen, num_batches, num_steps, batch_size)
