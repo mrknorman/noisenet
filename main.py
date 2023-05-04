@@ -1,7 +1,8 @@
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.layers import (
-    Conv1D, LeakyReLU, BatchNormalization, Conv1DTranspose, Input, Concatenate)
+    Conv1D, LeakyReLU, BatchNormalization, Conv1DTranspose, Input, Concatenate, MultiHeadAttention, Add, Activation, Multiply, MaxPooling1D)
+from tensorflow.keras.callbacks import ModelCheckpoint
 from tensorflow.keras.models import Model
 from datetime import datetime
 
@@ -17,6 +18,8 @@ from dataclasses import dataclass
 import matplotlib.pyplot as plt
 
 import os
+
+import math
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -144,55 +147,143 @@ def process_generator_output(noise_samples, gps_times):
 
     return noise_samples, conditions.stack()
 
-def process_generator_output_function(noise_samples, gps_times):
-    return tf.py_function(process_generator_output, [noise_samples, gps_times], [tf.float32, tf.float32])
+def process_generator_output_function(noise_samples, gps_times, num_steps):
+    processed_noise_samples, conditions = tf.py_function(process_generator_output, [noise_samples, gps_times], [tf.float32, tf.float32])
+    
+    noisy_data_seq = diffusion_process(processed_noise_samples, num_steps)
+    conditions = tf.repeat(conditions, num_steps, axis=0)
+    targets = tf.repeat(processed_noise_samples, num_steps, axis=0)
+    
+    # Generate a shuffled index tensor
+    batch_size = tf.shape(noisy_data_seq)[0]
+    shuffled_indices = tf.argsort(tf.random.uniform((batch_size,), dtype=tf.float32), axis=-1)
 
-def create_conditional_1d_denoising_model(input_shape, num_conditions, num_filters=32, kernel_size=3):
+    # Shuffle the tensors using the shuffled index tensor
+    shuffled_noisy_data_seq = tf.gather(noisy_data_seq, shuffled_indices)
+    shuffled_conditions = tf.gather(conditions, shuffled_indices)
+    shuffled_targets = tf.gather(targets, shuffled_indices)
+    
+    return (noisy_data_seq, conditions), targets
+
+def encoder_block(inputs, num_filters, kernel_size, attention_heads):
+    x = Conv1D(num_filters, kernel_size, padding='same')(inputs)
+    x = LeakyReLU()(x)
+    x = BatchNormalization()(x)
+
+    x = MultiHeadAttention(attention_heads, num_filters // attention_heads)(x, x)
+    x = LeakyReLU()(x)
+    x = BatchNormalization()(x)
+
+    skip = x
+
+    x = MaxPooling1D(2, padding='same')(x)
+
+    return x, skip
+
+
+def middle_block(inputs, num_filters, kernel_size, attention_heads):
+    x = Conv1D(num_filters, kernel_size, padding='same')(inputs)
+    x = LeakyReLU()(x)
+    x = BatchNormalization()(x)
+
+    x = MultiHeadAttention(attention_heads, num_filters // attention_heads)(x, x)
+    x = LeakyReLU()(x)
+    x = BatchNormalization()(x)
+
+    return x
+
+
+def decoder_block(inputs, skip, num_filters, kernel_size, attention_heads):
+    x = Conv1DTranspose(num_filters, kernel_size, strides=2, padding='same')(inputs)
+    x = LeakyReLU()(x)
+    x = BatchNormalization()(x)
+
+    x = Concatenate()([x, skip])
+
+    x = Conv1D(num_filters, kernel_size, padding='same')(x)
+    x = LeakyReLU()(x)
+    x = BatchNormalization()(x)
+
+    x = MultiHeadAttention(attention_heads, num_filters // attention_heads)(x, x)
+    x = LeakyReLU()(x)
+    x = BatchNormalization()(x)
+
+    return x
+
+def positional_encoding(inputs, pos_embedding_dim):
+    input_shape = tf.shape(inputs)
+    batch_size, seq_length, _ = input_shape[0], input_shape[1], input_shape[2]
+
+    position_indices = tf.range(seq_length, dtype=tf.float32)[:, tf.newaxis]
+    div_terms = tf.exp(-tf.math.log(10000.0) * (tf.range(0, pos_embedding_dim, 2, dtype=tf.float32) / pos_embedding_dim))
+    pos_encodings = position_indices * div_terms
+
+    sin_encodings = tf.sin(pos_encodings)
+    cos_encodings = tf.cos(pos_encodings)
+
+    pos_encodings = tf.stack([sin_encodings, cos_encodings], axis=2)
+    pos_encodings = tf.reshape(pos_encodings, (1, seq_length, pos_embedding_dim))
+
+    return tf.cast(pos_encodings, dtype=tf.float32)
+
+def create_conditional_attention_unet(input_shape, num_conditions, num_filters=32, kernel_size=3, attention_heads=8, pos_embedding_dim=16):
     audio_input = Input(shape=input_shape)
     conditions_input = Input(shape=(num_conditions,))
-    
+
+    # Add initial 1D convolution for feature extraction
     x = Conv1D(num_filters, kernel_size, padding='same')(audio_input)
     x = LeakyReLU()(x)
     x = BatchNormalization()(x)
     
-    # Repeat the conditions and concatenate with the feature maps
+    # Add conditions
     repeated_conditions = tf.repeat(tf.expand_dims(conditions_input, axis=1), input_shape[0], axis=1)
-    x = Concatenate(axis=-1)([x, repeated_conditions])
-    
-    x = Conv1D(num_filters * 2, kernel_size, padding='same')(x)
-    x = LeakyReLU()(x)
-    x = BatchNormalization()(x)
-    
-    x = Conv1DTranspose(num_filters * 2, kernel_size, padding='same')(x)
-    x = LeakyReLU()(x)
-    x = BatchNormalization()(x)
-    
-    x = Conv1DTranspose(num_filters, kernel_size, padding='same')(x)
-    x = LeakyReLU()(x)
-    x = BatchNormalization()(x)
-    
+    #x = Concatenate(axis=-1)([x, repeated_conditions])
+
+    # Add positional encoding
+    pos_encodings = positional_encoding(x, pos_embedding_dim)
+    x_with_pos = Concatenate(axis=-1)([x, pos_encodings])
+
+    # Encoder
+    encoder_outputs = []
+    x = x_with_pos
+    for i in range(2):
+        x, skip = encoder_block(x, num_filters * (2 ** i), kernel_size, attention_heads)
+        encoder_outputs.append(skip)
+
+    # Middle
+    x = middle_block(x, num_filters * 4, kernel_size, attention_heads)
+
+    # Decoder
+    for i in reversed(range(2)):
+        x = decoder_block(x, encoder_outputs[i], num_filters * (2 ** i), kernel_size, attention_heads)
+
+    # Output
     output = Conv1DTranspose(input_shape[-1], kernel_size, padding='same', activation='linear')(x)
-    
+
     model = Model(inputs=[audio_input, conditions_input], outputs=output)
-    
+
     return model
     
 def diffusion_process(processed_noise_samples, num_steps):
     expanded_input = tf.expand_dims(processed_noise_samples, axis=1) 
-    gaussian_noise = tf.random.normal(expanded_input.shape, dtype=tf.float32)
+    gaussian_noise = tf.random.normal(tf.shape(expanded_input), dtype=tf.float32)
     
     # Generate the linear noise_stddev_seq tensor with the correct shape
     linear_seq = tf.linspace(0.0, 1.0, num_steps)
     noise_stddev_seq = tf.reshape(linear_seq, [1, -1, 1, 1])
     
+    noise_shape = tf.shape(processed_noise_samples)
+    
     # Tile the noise_stddev_seq tensor along the first axis to match the first dimension of processed_noise_samples
-    noise_stddev_seq_expanded = tf.tile(noise_stddev_seq, [processed_noise_samples.shape[0], 1, processed_noise_samples.shape[1], processed_noise_samples.shape[2]])
+    noise_stddev_seq_expanded = tf.tile(noise_stddev_seq, [noise_shape[0], 1, noise_shape[1], noise_shape[2]])
     noisy_data_seq = expanded_input * (1.0 - noise_stddev_seq_expanded) + gaussian_noise * noise_stddev_seq_expanded
     
-    new_first_dim = (noisy_data_seq.shape[0] * noisy_data_seq.shape[1])
-    return tf.reshape(noisy_data_seq, (new_first_dim, noisy_data_seq.shape[2], noisy_data_seq.shape[3]))
+    data_seq_shape = tf.shape(noisy_data_seq)
+    
+    new_first_dim = (data_seq_shape[0] * data_seq_shape[1])
+    return tf.reshape(noisy_data_seq, (new_first_dim, data_seq_shape[2], data_seq_shape[3]))
 
-def train_conditional_denoising_model(model, generator, num_batches, num_steps, batch_size):
+def train_conditional_denoising_model(model, generator, max_num_examples, num_steps, batch_size):
     dataset = tf.data.Dataset.from_generator(
         generator,
         output_signature=(
@@ -201,23 +292,31 @@ def train_conditional_denoising_model(model, generator, num_batches, num_steps, 
         )
     )
     dataset = dataset.map(
-        process_generator_output_function,
+        lambda noise_samples, gps_times: process_generator_output_function(noise_samples, gps_times, num_steps),
         num_parallel_calls=tf.data.AUTOTUNE
     )
     dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+    
+    # Calculate the total number of steps per epoch
+    steps_per_epoch = batch_size*num_steps
 
-    for batch_num, (processed_noise_samples, conditions) in tqdm(enumerate(dataset)):    
-        
-        noisy_data_seq = diffusion_process(processed_noise_samples, num_steps)
-        
-        conditions = tf.repeat(conditions, num_steps, axis=0)
-        targets = tf.repeat(processed_noise_samples, num_steps, axis=0)
-                        
-        # Run a single training step
-        model.fit([noisy_data_seq, conditions], targets, epochs=1, batch_size=batch_size*num_steps, verbose=2)
-        
-        if (batch_num % 1000) == 0:
-            model.save("noisenet")
+    checkpoint_callback = ModelCheckpoint(
+        filepath="../noisenet_outputs/noisenet_{epoch:03d}.h5",
+        save_freq='epoch',
+        monitor="loss",
+        save_best_only=True,
+        verbose=1
+    )
+    
+    # Train the model
+    model.fit(
+        dataset,
+        batch_size = batch_size,
+        epochs = int(max_num_examples / steps_per_epoch*batch_size),
+        steps_per_epoch = steps_per_epoch,
+        callbacks = [checkpoint_callback],
+        verbose = 1
+    )
         
 def generate_conditional_audio(model, initial_noise, conditions, noise_stddev_seq):
     current_data = initial_noise
@@ -226,27 +325,13 @@ def generate_conditional_audio(model, initial_noise, conditions, noise_stddev_se
         current_data = prediction + np.random.normal(0, noise_stddev, current_data.shape)
     return current_data
 
-ifos = ("H1", "L1", "V1")
-
-O1 = (
-    "O1",
-    datetime(2015, 9, 12, 0, 0, 0),
-    datetime(2016, 1, 19, 0, 0, 0)
-)
-
-O2 = (
-    "O2",
-    datetime(2016, 11, 30, 0, 0, 0),
-    datetime(2017, 8, 25, 0, 0, 0)
-)
-
 O3 = (
     "O3",
     datetime(2019, 4, 1, 0, 0, 0),
     datetime(2020, 3, 27, 0, 0, 0)
 )
 
-observing_run_data = (O1, O2, O3)
+observing_run_data = (O3,)
 observing_runs = {}
 
 for run in observing_run_data:
@@ -260,48 +345,33 @@ channel = "DCS-CALIB_STRAIN_CLEAN_C01"
 frame_type = "HOFT_C01"
 state_flag = "DCS-ANALYSIS_READY_C01:1"
 
-batch_size = 32
-num_steps = 128
+batch_size = 8
+num_steps = 16
 
 max_num_examples = 1E6
-num_batches = int(max_num_examples / batch_size)
 
 sample_rate_hertz = 1024.0
 example_duration_seconds = 1.0
 
-background_noise_iterator = get_background_examples(
-    start = start,
-    stop = stop,
-    ifo = "L1",
-    sample_rate_hertz = sample_rate_hertz,
-    channel = channel,
-    frame_type = frame_type,
-    state_flag = state_flag,
-    example_duration_seconds = example_duration_seconds,
-    max_num_examples = max_num_examples,
-    num_examples_per_batch = batch_size
-)
-
 def return_gen():
     return get_background_examples(
-    start = start,
-    stop = stop,
-    ifo = "L1",
-    sample_rate_hertz = sample_rate_hertz,
-    channel = channel,
-    frame_type = frame_type,
-    state_flag = state_flag,
-    example_duration_seconds = example_duration_seconds,
-    max_num_examples = max_num_examples,
-    num_examples_per_batch = batch_size,
-    order = "random"
-)
+        start = start,
+        stop = stop,
+        ifo = "L1",
+        sample_rate_hertz = sample_rate_hertz,
+        channel = channel,
+        frame_type = frame_type,
+        state_flag = state_flag,
+        example_duration_seconds = example_duration_seconds,
+        max_num_examples = max_num_examples,
+        num_examples_per_batch = batch_size,
+        order = "shortest"
+    )
 
 if __name__ == "__main__":
     
-    strategy = setup_CUDA(True, "0")
+    strategy = setup_CUDA(True, "0,1,2,3,4,5,6,7")
     print("CUDA setup complete.")
-    
     
     with strategy.scope():
         epochs = 10
@@ -309,10 +379,7 @@ if __name__ == "__main__":
         input_shape = (int(sample_rate_hertz * example_duration_seconds), 1)
         num_conditions = 9
 
-        model = create_conditional_1d_denoising_model(input_shape, num_conditions)
-        print("Denoising model created.")  # Add a print statement after creating the denoising model
-
+        model = create_conditional_attention_unet(input_shape, num_conditions)
         model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-6), loss='mean_squared_error')
-        print("Model compiled.")  # Add a print statement after compiling the model
         
-        train_conditional_denoising_model(model, return_gen, num_batches, num_steps, batch_size)
+        train_conditional_denoising_model(model, return_gen, max_num_examples, num_steps, batch_size)

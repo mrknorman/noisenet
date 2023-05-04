@@ -89,7 +89,7 @@ def get_background_examples(
         )
 
         data = TimeSeries.read(
-            files, channel=f"{ifo}:{channel}", start=segment_start, end=segment_end
+            files, channel=f"{ifo}:{channel}", start=segment_start, end=segment_end, nproc=4
         )
         data = data.resample(sample_rate_hertz)
         data = data.whiten(4, 2)
@@ -118,6 +118,7 @@ def get_background_examples(
                 current_example_index += num_examples_per_batch;
                 
                 if (max_num_examples > 0) and (current_example_index > max_num_examples):
+                    print("Exausted Examples! Exiting!")
                     return
                                     
                 yield batch_noise_data
