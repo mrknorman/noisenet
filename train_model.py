@@ -12,7 +12,7 @@ from tensorflow.keras import mixed_precision
 
 from tqdm import tqdm
 
-from get_background import get_background_examples
+from py_ml_tools.noise import get_noise
 from dataclasses import dataclass
 
 import matplotlib.pyplot as plt
@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import tensorflow as tf
 
-def save_diffusion_plots(output_data, labels, batch_idx, num_steps, N, file_name='diffusion_plots.png'):
+def save_diffusion_plots(output_data, labels, batch_idx, num_steps, N, file_name='../noisenet_data/diffusion_plots.png'):
     """
     Takes the output of the diffusion process and saves N evenly spaced subplots between step 0 and the max step.
 
@@ -283,7 +283,7 @@ def diffusion_process(processed_noise_samples, num_steps):
     new_first_dim = (data_seq_shape[0] * data_seq_shape[1])
     return tf.reshape(noisy_data_seq, (new_first_dim, data_seq_shape[2], data_seq_shape[3]))
 
-def train_conditional_denoising_model(model, generator, max_num_examples, num_steps, batch_size):
+def train_conditional_denoising_model(model, generator, max_num_examples, num_steps, batch_size, output_path):
     dataset = tf.data.Dataset.from_generator(
         generator,
         output_signature=(
@@ -301,7 +301,7 @@ def train_conditional_denoising_model(model, generator, max_num_examples, num_st
     steps_per_epoch = batch_size*num_steps
 
     checkpoint_callback = ModelCheckpoint(
-        filepath="../noisenet_outputs/noisenet_{epoch:03d}.h5",
+        filepath=f"{output_path}/noisenet_{epoch:03d}.h5",
         save_freq='epoch',
         monitor="loss",
         save_best_only=True,
@@ -354,7 +354,7 @@ sample_rate_hertz = 1024.0
 example_duration_seconds = 1.0
 
 def return_gen():
-    return get_background_examples(
+    return get_noise(
         start = start,
         stop = stop,
         ifo = "L1",
@@ -370,11 +370,13 @@ def return_gen():
 
 if __name__ == "__main__":
     
-    strategy = setup_CUDA(True, "0,1,2,3,4,5,6,7")
+    strategy = setup_CUDA(True, "1,2,3,4,5,6,7")
     print("CUDA setup complete.")
     
     with strategy.scope():
         epochs = 10
+        
+        output_path = "../noisenet_outputs"
 
         input_shape = (int(sample_rate_hertz * example_duration_seconds), 1)
         num_conditions = 9
@@ -382,4 +384,11 @@ if __name__ == "__main__":
         model = create_conditional_attention_unet(input_shape, num_conditions)
         model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-6), loss='mean_squared_error')
         
-        train_conditional_denoising_model(model, return_gen, max_num_examples, num_steps, batch_size)
+        train_conditional_denoising_model(
+            model, 
+            return_gen, 
+            max_num_examples, 
+            num_steps, 
+            batch_size, 
+            output_path
+        )
