@@ -354,9 +354,10 @@ sample_rate_hertz = 1024.0
 example_duration_seconds = 1.0
 
 def return_gen():
-    return get_noise(
+    return get_data(
         start = start,
         stop = stop,
+        data_labels = ["noise", "glitches"],
         ifo = "L1",
         sample_rate_hertz = sample_rate_hertz,
         channel = channel,
